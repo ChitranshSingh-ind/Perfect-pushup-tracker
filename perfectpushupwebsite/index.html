@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perfect Pushup AI</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script> 
+
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #222; color: white; margin: 0; }
+        #container { position: relative; width: 640px; height: 480px; margin: 10px auto; }
+        #webcam, #output_canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; border-radius: 10px; }
+        #webcam { transform: rotateY(180deg); opacity: 0; } /* Hide raw video */
+        #output_canvas { z-index: 10; transform: rotateY(180deg); } /* Show canvas on top */
+        
+        #ui { position: fixed; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 10px; z-index: 20; text-align: left; pointer-events: none; }
+        #counter { font-size: 48px; color: #00ff00; font-weight: bold; margin: 0; }
+        #status { font-size: 18px; color: white; }
+        #bad-form { color: #ff4444; font-weight: bold; display: none; margin-top: 10px;}
+    </style>
+</head>
+<body>
+
+    <h1>Perfect Pushup AI</h1>
+    <p>Position yourself **sideways** to the camera. Entire body visible.</p>
+
+    <div id="ui">
+        <div>REPS</div>
+        <div id="counter">0</div>
+        <div id="status">Wait...</div>
+        <div id="bad-form">FIX YOUR BACK!</div>
+    </div>
+
+    <div id="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+<script type="module">
+    const videoElement = document.getElementById('webcam');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    
+    const counterUI = document.getElementById('counter');
+    const statusUI = document.getElementById('status');
+    const badFormUI = document.getElementById('bad-form');
+
+    // State Variables
+    let counter = 0;
+    let stage = null; // 'up' or 'down'
+    let recentAngles = []; // Store recent angles for smoothing
+
+    // --- MATH: Calculate Angle ---
+    function calculateAngle(a, b, c) {
+        let radians = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x);
+        let angle = Math.abs(radians * 180.0 / Math.PI);
+        if (angle > 180.0) { angle = 360.0 - angle; }
+        return angle;
+    }
+
+    // --- Smooth angles over time ---
+    function smoothAngle(angle) {
+        recentAngles.push(angle);
+        if (recentAngles.length > 5) recentAngles.shift(); // Keep last 5 frames
+        return recentAngles.reduce((a, b) => a + b) / recentAngles.length;
+    }
+
+    // --- MediaPipe Pose Setup ---
+    const pose = new Pose({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+    });
+
+    // Note: The Web API doesn't use "Heavy/Lite" task files. 
+    // It uses specialized web models automatically.
+    pose.setOptions({
+        modelComplexity: 1, // 0=Lite, 1=Full, 2=Heavy. We use 1 for web speed.
+        smoothLandmarks: true,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    // --- Output Results Logic (Equivalent to Python's main loop) ---
+    function onResults(results) {
+        if (!results.poseLandmarks) {
+            statusUI.innerText = "No Body Detected";
+            return;
+        }
+        statusUI.innerText = "Tracking";
+
+        // 1. Draw the Background Video Frame
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        // 2. Draw the Debug Skeleton (Auto-draw in JS!)
+        drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+        drawLandmarks(canvasCtx, results.poseLandmarks, {color: '#FF0000', lineWidth: 1, radius: 3});
+
+        // 3. Extract Landmarks
+        const landmarks = results.poseLandmarks;
+        
+        // Key Points (Using Left side as default - landmarks 11,13,15,23,27)
+        const shoulder = landmarks[11];
+        const elbow    = landmarks[13];
+        const wrist    = landmarks[15];
+        const hip      = landmarks[23];
+        const ankle    = landmarks[27];
+
+        // 4. Calculate Angles
+        const armAngle = calculateAngle(shoulder, elbow, wrist);
+        const backAngle = calculateAngle(shoulder, hip, ankle);
+        const smoothedArmAngle = smoothAngle(armAngle);
+
+        // 5. Perfect Pushup Logic - Improved Detection
+        // Relax form check - back between 110-180 degrees
+        let isFormGood = backAngle > 110;
+
+        if (!isFormGood) {
+            badFormUI.style.display = 'block';
+        } else {
+            badFormUI.style.display = 'none';
+        }
+
+        // Improved State Machine with better transitions
+        // Initialize stage if null (first detection)
+        if (stage === null && smoothedArmAngle > 100) {
+            stage = "up";
+        }
+
+        // UP → DOWN transition (elbows bending)
+        if (stage === "up" && smoothedArmAngle <= 90) {
+            stage = "down";
+        }
+
+        // DOWN → UP transition (elbows extending back)
+        if (stage === "down" && smoothedArmAngle > 120) {
+            if (isFormGood) {
+                counter++;
+                counterUI.innerText = counter;
+                console.log("Rep #" + counter + " (Arm: " + Math.round(armAngle) + "°, Back: " + Math.round(backAngle) + "°)");
+            } else {
+                console.log("Form warning - Back angle: " + Math.round(backAngle) + "°");
+            }
+            stage = "up";
+        }
+
+        // Display debug info
+        statusUI.innerText = `Arm: ${Math.round(smoothedArmAngle)}° | Back: ${Math.round(backAngle)}° | ${stage || "INIT"}`;
+        canvasCtx.restore();
+    }
+
+    // Connect function to Pose instance
+    pose.onResults(onResults);
+
+    // --- Start the Camera ---
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await pose.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    camera.start().catch(err => {
+        console.error("Camera Error:", err);
+        statusUI.innerText = "Camera Error: " + err.message;
+    });
+
+    // Set canvas resolution to match camera
+    canvasElement.width = 640;
+    canvasElement.height = 480;
+    console.log("Canvas initialized:", canvasElement.width, "x", canvasElement.height);
+
+</script>
+</body>
+</html>
